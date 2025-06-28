@@ -77,7 +77,7 @@ class MultimodalApp:
             self.mp_drawing = mp.solutions.drawing_utils
             
             # YOLO for object detection
-            self.yolo_model = YOLO('yolov8n.pt')
+            self.yolo_model = YOLO("yolov8n.pt")
             
             # Speech recognition (legacy)
             self.recognizer = sr.Recognizer()
@@ -517,41 +517,44 @@ class MultimodalApp:
             await self.fallback_speech_recognition()
             return
         
-        # Audio callback function for real-time processing
-        async def audio_callback(indata, frames, time, status):
+        # ✅ FIXED: Audio callback function must be synchronous for sounddevice
+        def audio_callback(indata, frames, time_info, status):
             if status:
                 print(f"Audio status: {status}")
             if self.speech_running:
                 # Convert to float32 and add to buffer
                 audio_data = indata[:, 0].astype(np.float32)
                 self.audio_buffer.extend(audio_data)
-                
-                # Process buffer when it has enough data (2 seconds)
+
+                # When buffer reaches 2 seconds of audio, process it
                 if len(self.audio_buffer) >= self.sample_rate * 2:
-                    await self.process_audio_buffer()
+                    asyncio.run_coroutine_threadsafe(
+                        self.process_audio_buffer(),
+                        self.loop
+                    )
         
         try:
-            # Start audio stream
+            # Start audio input stream
             with sd.InputStream(
                 callback=audio_callback,
                 channels=1,
                 samplerate=self.sample_rate,
                 dtype=np.float32,
-                blocksize=int(self.sample_rate * 0.5)  # 0.5 second blocks
+                blocksize=int(self.sample_rate * 0.5)  # 0.5-second blocks
             ):
                 self.log_message("🎤 Audio stream started")
-                
-                # Keep the stream alive
+
+                # Keep the audio stream alive while speech recognition is running
                 while self.speech_running:
                     await asyncio.sleep(0.1)
-                    
+
         except Exception as e:
             self.log_message(f"❌ Speech recognition error: {str(e)}")
-            # Fallback to traditional method
+            # Fallback to traditional method in case of failure
             await self.fallback_speech_recognition()
-        
+
         self.log_message("🎤 Speech recognition stopped")
-    
+
     async def fallback_speech_recognition(self):
         """Fallback speech recognition using traditional method"""
         try:
@@ -618,53 +621,52 @@ class MultimodalApp:
         try:
             if len(self.audio_buffer) < self.sample_rate * 1:  # Need at least 1 second
                 return
-            
+
             # Get audio data and clear buffer
             audio_data = np.array(self.audio_buffer[:self.sample_rate * 2])  # Process 2 seconds
             self.audio_buffer = self.audio_buffer[self.sample_rate * 2:]
-            
+
             # Normalize audio
             audio_data = audio_data / np.max(np.abs(audio_data)) if np.max(np.abs(audio_data)) > 0 else audio_data
-            
+
             # Check if there's actual speech (simple energy-based detection)
             energy = np.mean(audio_data ** 2)
             if energy < 0.001:  # Threshold for silence
                 return
-            
-            # Save audio to temporary file
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-                temp_filename = temp_file.name
-            
-            # Save as WAV file
-            wav.write(temp_filename, self.sample_rate, audio_data.astype(np.float32))
-            
-            # Transcribe using Whisper
-            if self.whisper_model:
-                try:
-                    result = self.whisper_model.transcribe(temp_filename, language="en")
-                    transcription = result["text"].strip()
-                    
-                    if transcription:
-                        # Update transcription display
-                        self.current_transcription = transcription
-                        await self.transcription_queue.put(transcription)
-                        
-                        # Process voice commands
-                        await self.process_voice_command(transcription.lower())
-                        
-                        self.log_message(f"🎤 Transcribed: {transcription}")
-                        
-                except Exception as e:
-                    self.log_message(f"⚠️ Whisper transcription error: {str(e)}")
-            
-            # Clean up temporary file
+
+            # Save audio to temporary WAV file correctly
             try:
-                os.unlink(temp_filename)
-            except:
-                pass
-                
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                    temp_filename = temp_file.name
+                    # Save as int16 for better compatibility
+                    audio_int16 = np.int16(audio_data * 32767)
+                    wav.write(temp_file, self.sample_rate, audio_int16)
+
+                # Transcribe using Whisper
+                if self.whisper_model:
+                    try:
+                        result = self.whisper_model.transcribe(temp_filename, language="en")
+                        transcription = result["text"].strip()
+
+                        if transcription:
+                            self.current_transcription = transcription
+                            await self.transcription_queue.put(transcription)
+                            await self.process_voice_command(transcription.lower())
+                            self.log_message(f"🎤 Transcribed: {transcription}")
+
+                    except Exception as e:
+                        self.log_message(f"⚠️ Whisper transcription error: {str(e)}")
+
+            finally:
+                # Clean up temp file safely
+                try:
+                    os.unlink(temp_filename)
+                except:
+                    pass
+
         except Exception as e:
             self.log_message(f"❌ Audio processing error: {str(e)}")
+
     
     async def process_voice_command(self, command):
         """Process voice commands"""
@@ -712,49 +714,77 @@ class MultimodalApp:
             self.log_message(f"❌ Voice command error: {str(e)}")
     
     async def object_detection_loop(self):
-        """Main loop for object detection"""
-        self.log_message("👁️ Object detection started")
-        
+        """Main loop for YOLOv8n object detection with bounding boxes and confidence"""
+        self.log_message("👁️ YOLOv8n object detection started")
+
+        target_classes = {
+            "person", "cell phone", "bottle", "sports ball",
+            "remote", "laptop", "keyboard", "knife", "book", "tv", "backpack"
+        }
+
+        last_detected = None
+
         while self.object_running and self.cap and self.cap.isOpened():
             try:
                 ret, frame = self.cap.read()
                 if not ret:
                     continue
-                
-                # Run YOLO detection
+
+                # Run YOLOv8n inference
                 results = self.yolo_model(frame, verbose=False)
-                
+
                 detected_objects = []
-                for result in results:
+
+                if results:
+                    result = results[0]  # Get the first result
                     boxes = result.boxes
                     if boxes is not None:
                         for box in boxes:
-                            # Get box coordinates
-                            x1, y1, x2, y2 = box.xyxy[0]
-                            confidence = box.conf[0]
+                            confidence = float(box.conf[0])
+                            if confidence < 0.5:
+                                continue
+
                             class_id = int(box.cls[0])
-                            class_name = self.yolo_model.names[class_id]
-                            
-                            if confidence > 0.5:  # Confidence threshold
+                            class_name = self.yolo_model.names[class_id].lower()
+
+                            if class_name in target_classes:
+                                x1, y1, x2, y2 = map(int, box.xyxy[0])
                                 detected_objects.append({
                                     'name': class_name,
-                                    'confidence': float(confidence),
-                                    'bbox': [int(x1), int(y1), int(x2), int(y2)]
+                                    'confidence': confidence,
+                                    'bbox': [x1, y1, x2, y2]
                                 })
-                
+
+                                # Draw box and label directly on the original frame
+                                label = f"{class_name.title()} {confidence * 100:.1f}%"
+                                color = (0, 255, 0)
+                                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                                cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+                # If something detected, send to queue
                 if detected_objects:
-                    # Get most confident detection
                     best_detection = max(detected_objects, key=lambda x: x['confidence'])
-                    await self.object_queue.put(best_detection)
-                    self.log_message(f"👁️ Detected: {best_detection['name']} ({best_detection['confidence']:.2f})")
-                
-                await asyncio.sleep(0.1)  # Reduce CPU usage
-                
+                    if last_detected != best_detection['name']:
+                        last_detected = best_detection['name']
+                        await self.object_queue.put(best_detection)
+                        self.log_message(f"👁️ Detected: {best_detection['name'].title()} ({best_detection['confidence']:.2f})")
+
+                # Resize and update the GUI frame
+                frame_resized = cv2.resize(frame, (640, 480))
+                rgb_frame = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+                img = ImageTk.PhotoImage(Image.fromarray(rgb_frame))
+                self.image_label.config(image=img)
+                self.image_label.image = img
+
+                await asyncio.sleep(0.05)
+
             except Exception as e:
-                self.log_message(f"❌ Object detection error: {str(e)}")
+                self.log_message(f"❌ YOLOv8n detection error: {str(e)}")
                 break
-        
+
         self.log_message("👁️ Object detection stopped")
+
+
     
     async def async_gui_update(self):
         """Async GUI update loop"""
