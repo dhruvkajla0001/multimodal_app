@@ -1,0 +1,16 @@
+opencv-python==4.8.1.78
+mediapipe==0.10.7
+speechrecognition==3.10.0
+pyaudio==0.2.11
+ultralytics==8.0.196
+numpy==1.24.3
+tkinter-tooltip==2.0.0
+pillow==10.0.1
+pyautogui==0.9.54
+screen-brightness-control==0.15.0
+psutil==5.9.5
+sounddevice==0.4.6
+scipy==1.11.1
+whisper==1.1.10
+torch==2.0.1
+torchaudio==2.0.2 
